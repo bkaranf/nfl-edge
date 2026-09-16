@@ -18,17 +18,24 @@ from backend.storage import Store
 
 
 def create_app(db_path=None, collect=True):
-    store = Store(db_path)
-    service = Service(store)
+    store = Store(db_path) if db_path is not None else None
+    service = Service(store) if store is not None else None
 
     @asynccontextmanager
     async def lifespan(app):
+        nonlocal store, service
+        if store is None:
+            store = Store()
+            service = Service(store)
+            app.state.store, app.state.service = store, service
         task = asyncio.create_task(service.loop()) if collect and os.environ.get("NFL_EDGE_NO_COLLECT") != "1" else None
-        yield
-        if task:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        try:
+            yield
+        finally:
+            if task:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(title="NFL Edge", version="0.1.0", lifespan=lifespan)
     app.state.store, app.state.service = store, service

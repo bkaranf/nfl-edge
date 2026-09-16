@@ -1,0 +1,9 @@
+# Project defaults only. Never override user approval, sandbox, or provider policy.
+# Verify effective native session metadata; configuration is not execution proof.
+model = "gpt-6-astra"
+model_reasoning_effort = "max"
+
+[agents]
+default_subagent_model = "gpt-5.6-sol"
+default_subagent_reasoning_effort = "xhigh"
+max_concurrent_threads_per_session = 3

@@ -1,11 +1,12 @@
 """Canonical NFL identities, times and request validation."""
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_DOWN
+from enum import Enum
 import re
 from typing import Literal
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, PrivateAttr, field_validator, model_validator
 
 TEAMS = {
     "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
@@ -93,11 +94,120 @@ class RequestModel(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+class EvaluationStatus(str, Enum):
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
+    RESEARCH_ONLY = "RESEARCH_ONLY"
+    MEETS_ESTIMATED_SCREEN = "MEETS_ESTIMATED_SCREEN"
+    EXPIRED = "EXPIRED"
+
+
+class ReasonCode(str, Enum):
+    EVENT_NOT_PREGAME = "EVENT_NOT_PREGAME"
+    REFERENCE_PAIR_MISSING = "REFERENCE_PAIR_MISSING"
+    INTEGER_ADJACENT_PAIRS_MISSING = "INTEGER_ADJACENT_PAIRS_MISSING"
+    INSUFFICIENT_ELIGIBLE_REFERENCES = "INSUFFICIENT_ELIGIBLE_REFERENCES"
+    REFERENCE_DISAGREEMENT = "REFERENCE_DISAGREEMENT"
+    QUOTE_STALE = "QUOTE_STALE"
+    QUOTE_TIMESTAMP_IN_FUTURE = "QUOTE_TIMESTAMP_IN_FUTURE"
+    FEES_UNCONFIRMED = "FEES_UNCONFIRMED"
+    SETTLEMENT_PROFILE_REQUIRED = "SETTLEMENT_PROFILE_REQUIRED"
+    SETTLEMENT_PROFILE_UNKNOWN = "SETTLEMENT_PROFILE_UNKNOWN"
+    SETTLEMENT_PROFILE_NOT_ADMITTED = "SETTLEMENT_PROFILE_NOT_ADMITTED"
+    SETTLEMENT_PROFILE_NOT_EFFECTIVE = "SETTLEMENT_PROFILE_NOT_EFFECTIVE"
+    SETTLEMENT_PROFILE_CONTRADICTION = "SETTLEMENT_PROFILE_CONTRADICTION"
+    OUTCOME_RETURN_REQUIRED = "OUTCOME_RETURN_REQUIRED"
+    INTEGER_LINE_RESEARCH_ONLY = "INTEGER_LINE_RESEARCH_ONLY"
+    ROI_BELOW_MINIMUM = "ROI_BELOW_MINIMUM"
+    STRESSED_ROI_NOT_POSITIVE = "STRESSED_ROI_NOT_POSITIVE"
+
+
+class ProfileAdmission(str, Enum):
+    UNVERIFIED = "UNVERIFIED"
+    ADMITTED = "ADMITTED"
+    RETIRED = "RETIRED"
+
+
+class Outcome(str, Enum):
+    WIN = "win"
+    TIE_OR_PUSH = "tie_or_push"
+    LOSS = "loss"
+
+
+class ReturnRequirement(str, Enum):
+    REQUIRED = "REQUIRED"
+    FORBIDDEN = "FORBIDDEN"
+
+
+class SettlementProfileRef(RequestModel):
+    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,79}$")
+    version: int = Field(ge=1, le=1000000)
+
+
+class NetOutcomeReturns(RequestModel):
+    win: Decimal = Field(ge=0, le=10000000, decimal_places=2)
+    tie_or_push: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
+    loss: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
+
+
+class OutcomeReturnRule(RequestModel):
+    requirement: ReturnRequirement
+    exact: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
+
+    @model_validator(mode="after")
+    def exact_only_for_required(self):
+        if self.requirement == ReturnRequirement.FORBIDDEN and self.exact is not None:
+            raise ValueError("A forbidden outcome cannot specify an exact return")
+        return self
+
+
+class SettlementProfile(RequestModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, frozen=True)
+
+    profile_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{2,79}$")
+    version: int = Field(ge=1, le=1000000)
+    content_hash: str = Field(min_length=1, max_length=96)
+    exchange: Literal["UDX", "Kalshi", "Nadex"]
+    product: str = Field(min_length=1, max_length=80)
+    sport: Literal["NFL"] = "NFL"
+    market: Literal["moneyline", "spread", "total"]
+    period: Literal["full_game"] = "full_game"
+    season_types: tuple[Literal["REG", "POST"], ...]
+    overtime_included: bool
+    outcome_rules: dict[Outcome, OutcomeReturnRule]
+    conditional_on_ordinary_completion: bool = True
+    evidence_ids: tuple[str, ...] = ()
+    effective_from: datetime
+    effective_to: datetime | None = None
+    admission: ProfileAdmission = ProfileAdmission.UNVERIFIED
+    admitted_at: datetime | None = None
+    decision_id: str | None = Field(default=None, max_length=120)
+
+    @field_validator("effective_from", "effective_to", "admitted_at")
+    @classmethod
+    def profile_timezones_required(cls, value):
+        return None if value is None else dt(value)
+
+    @model_validator(mode="after")
+    def validate_profile(self):
+        expected = {Outcome.WIN, Outcome.TIE_OR_PUSH, Outcome.LOSS}
+        if set(self.outcome_rules) != expected:
+            raise ValueError("A profile must define win, tie_or_push, and loss return rules")
+        if not self.season_types:
+            raise ValueError("A profile must identify at least one season type")
+        if self.effective_to is not None and self.effective_to <= self.effective_from:
+            raise ValueError("Profile effective_to must be after effective_from")
+        if self.admission == ProfileAdmission.ADMITTED:
+            if not self.evidence_ids or self.admitted_at is None or not self.decision_id:
+                raise ValueError("An admitted profile requires evidence, admission time, and decision ID")
+        return self
+
+
 class Pick(RequestModel):
     game_id: str = Field(min_length=5, max_length=80)
     market: Literal["moneyline", "spread", "total"]
     side: Literal["home", "away", "over", "under"]
     line: FiniteFloat | None = None
+    period: Literal["full_game"] = "full_game"
 
     @model_validator(mode="after")
     def validate_pick(self):
@@ -114,13 +224,50 @@ class Pick(RequestModel):
 
 class QuoteInput(Pick):
     total_cost: Decimal = Field(gt=0, le=1000000, decimal_places=2)
-    winning_payout: Decimal = Field(gt=0, le=10000000, decimal_places=2)
+    winning_payout: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
     observed_at: datetime
     exchange: Literal["Unknown", "UDX", "Kalshi", "Nadex"] = "Unknown"
     fees_confirmed: bool = False
     rules_confirmed: bool = False
     push_return: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
+    losing_return: Decimal | None = Field(default=None, ge=0, le=10000000, decimal_places=2)
+    outcome_returns: NetOutcomeReturns | None = None
+    settlement_profile: SettlementProfileRef | None = None
+    quantity: Decimal | None = Field(default=None, gt=0, le=1000000000, decimal_places=6)
+    contract_id: str | None = Field(default=None, max_length=200)
     mode: Literal["paper", "actual"] = "paper"
+    _original_monetary_strings: dict[str, object] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def capture_original_monetary_strings(cls, value, handler):
+        raw = value if isinstance(value, dict) else {}
+        nested = raw.get("outcome_returns")
+        if isinstance(nested, BaseModel):
+            nested = nested.model_dump(mode="json")
+        nested = nested if isinstance(nested, dict) else {}
+
+        def text(raw):
+            return None if raw is None else str(raw)
+
+        captured = {
+            "total_cost": text(raw.get("total_cost")),
+            "winning_payout": text(raw.get("winning_payout")),
+            "push_return": text(raw.get("push_return")),
+            "losing_return": text(raw.get("losing_return")),
+            "outcome_returns": {
+                "win": text(nested.get("win")),
+                "tie_or_push": text(nested.get("tie_or_push")),
+                "loss": text(nested.get("loss")),
+            },
+        }
+        model = handler(value)
+        model._original_monetary_strings = captured
+        return model
+
+    @property
+    def original_monetary_strings(self) -> dict[str, object]:
+        return self._original_monetary_strings
 
     @field_validator("observed_at")
     @classmethod
@@ -128,11 +275,33 @@ class QuoteInput(Pick):
         return dt(value)
 
     @model_validator(mode="after")
-    def payout_exceeds_cost(self):
-        if self.winning_payout <= self.total_cost:
-            raise ValueError("Enter total winning return, including returned stake; it must exceed cost")
-        if self.push_return is not None and self.push_return > self.winning_payout:
-            raise ValueError("Push return cannot exceed the winning payout")
+    def canonicalize_outcome_returns(self):
+        canonical = self.outcome_returns
+        if canonical is None:
+            if self.winning_payout is None:
+                raise ValueError("Provide outcome_returns.win or winning_payout")
+            canonical = NetOutcomeReturns(
+                win=self.winning_payout,
+                tie_or_push=self.push_return,
+                loss=self.losing_return,
+            )
+        else:
+            conflicts = []
+            if self.winning_payout is not None and self.winning_payout != canonical.win:
+                conflicts.append("winning_payout")
+            if self.push_return is not None and self.push_return != canonical.tie_or_push:
+                conflicts.append("push_return")
+            if self.losing_return is not None and self.losing_return != canonical.loss:
+                conflicts.append("losing_return")
+            if conflicts:
+                raise ValueError(
+                    "OUTCOME_RETURN_CONTRADICTION: legacy fields disagree with outcome_returns: "
+                    + ", ".join(conflicts)
+                )
+        object.__setattr__(self, "outcome_returns", canonical)
+        object.__setattr__(self, "winning_payout", canonical.win)
+        object.__setattr__(self, "push_return", canonical.tie_or_push)
+        object.__setattr__(self, "losing_return", canonical.loss)
         return self
 
 

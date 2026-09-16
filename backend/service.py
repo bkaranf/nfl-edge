@@ -5,8 +5,8 @@ import logging
 
 import httpx
 
-from backend.domain import Pick, QuoteInput, dt, iso, utcnow
-from backend.engine import estimate, make_board, returns, stake_cap
+from backend.domain import Pick, QuoteInput, ReasonCode, dt, iso, utcnow
+from backend.engine import estimate, make_board, scenario_returns, stake_cap
 from backend.providers import fetch_bovada, fetch_espn, fetch_kalshi, parse_kalshi
 from backend.storage import Store
 
@@ -19,6 +19,65 @@ SOURCE_INFO = {
     "kalshi": {"name": "Kalshi", "kind": "Exchange comparison", "url": "https://docs.kalshi.com/getting_started/quick_start_market_data",
                "note": "Ask prices exclude fees and are not Underdog quotes. Does not count as a sportsbook vote."},
 }
+
+
+def _closing_financial_preflight(evaluation: dict, quote: QuoteInput) -> dict:
+    """Validate stored payoff inputs before looking for closing references."""
+    settlement = (evaluation.get("calculation") or {}).get("settlement_profile") or {}
+    resolved = settlement.get("resolved")
+    snapshot = resolved if isinstance(resolved, dict) else {}
+    rule = (snapshot.get("outcome_rules") or {}).get("tie_or_push") or {}
+    requirement = rule.get("requirement")
+    integer = (
+        quote.market != "moneyline"
+        and quote.line is not None
+        and quote.line == int(quote.line)
+    )
+    if requirement == "FORBIDDEN":
+        tie_possible = False
+    elif requirement == "REQUIRED":
+        tie_possible = True
+    else:
+        tie_possible = True if quote.market == "moneyline" or integer else None
+
+    returns_vector = quote.outcome_returns
+    missing_returns = []
+    if returns_vector is None or returns_vector.win is None:
+        missing_returns.append("win")
+    if returns_vector is None or returns_vector.loss is None:
+        missing_returns.append("loss")
+    if tie_possible is True and (
+        returns_vector is None or returns_vector.tie_or_push is None
+    ):
+        missing_returns.append("tie_or_push")
+    if missing_returns:
+        return {
+            "admissible": False,
+            "tie_possible": None,
+            "reason_code": ReasonCode.OUTCOME_RETURN_REQUIRED.value,
+            "reason": (
+                "Closing financial calculation blocked because explicit net returns are "
+                f"missing for: {', '.join(missing_returns)}."
+            ),
+        }
+
+    if resolved is not None and settlement.get("compatible") is not True:
+        entry_codes = set(evaluation.get("reason_codes") or [])
+        reason = (
+            "Closing financial calculation blocked because the pinned settlement "
+            "profile contradicts the entered economics."
+            if ReasonCode.SETTLEMENT_PROFILE_CONTRADICTION.value in entry_codes
+            else
+            "Closing financial calculation blocked because compatibility with the "
+            "pinned settlement profile was not proven."
+        )
+        return {
+            "admissible": False,
+            "tie_possible": None,
+            "reason_code": ReasonCode.SETTLEMENT_PROFILE_CONTRADICTION.value,
+            "reason": reason,
+        }
+    return {"admissible": True, "tie_possible": tie_possible}
 
 
 class Service:
@@ -105,14 +164,30 @@ class Service:
             start = dt(g["start_time"])
             if start > utcnow():
                 continue
+            q = QuoteInput(**bet["quote"])
+            financial = _closing_financial_preflight(bet["evaluation"], q)
+            if not financial["admissible"]:
+                bet["closing"] = {
+                    "status": "unavailable",
+                    "captured_at": iso(),
+                    "reason_code": financial["reason_code"],
+                    "reason": financial["reason"],
+                }
+                self.store.update_bet(bet)
+                continue
             quotes = self.store.historical_quotes(iso(start-timedelta(minutes=5)), iso(start))
             quotes = [q for q in quotes if start-timedelta(minutes=5) <= dt(q["observed_at"]) < start]
             pick = Pick(**{k: bet["quote"][k] for k in ("game_id", "market", "side", "line")})
             settings = {**bet["evaluation"]["settings"], "max_age_seconds": 300}
             prob = estimate(quotes, pick, settings, start)
             prob["is_moneyline"] = pick.market == "moneyline"
-            q = QuoteInput(**bet["quote"])
-            scenarios = returns(prob, g, float(q.winning_payout), float(q.push_return) if q.push_return is not None else None, settings)
+            scenarios = scenario_returns(
+                prob,
+                g,
+                q.outcome_returns,
+                settings,
+                tie_possible=financial["tie_possible"],
+            )
             if scenarios:
                 value = min(s["expected_return"] for s in scenarios)
                 bet["closing"] = {"status": "supported" if prob["enough"] else "indicative", "captured_at": iso(),

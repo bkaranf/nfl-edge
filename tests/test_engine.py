@@ -1,13 +1,64 @@
 from datetime import UTC, datetime, timedelta
 import pytest
 
-from backend.domain import Pick, QuoteInput, Settings, american_to_decimal, game, iso, team_code
+from backend.domain import (
+    Outcome,
+    OutcomeReturnRule,
+    Pick,
+    ProfileAdmission,
+    QuoteInput,
+    ReturnRequirement,
+    Settings,
+    american_to_decimal,
+    game,
+    iso,
+    team_code,
+)
 from backend.engine import estimate, evaluate, pairs, stake_cap
 from backend.providers import quote
+from backend.settlement_profiles import build_profile
 
 NOW = datetime(2026, 9, 15, 12, tzinfo=UTC)
 GAME = game("BUF", "DET", NOW + timedelta(days=2))
 SETTINGS = Settings(bankroll="1000").model_dump(mode="json")
+
+
+def admitted_profile(profile_id, market, *, tie_required=False, season_types=("REG",)):
+    return build_profile(
+        profile_id=profile_id,
+        version=1,
+        exchange="Kalshi",
+        product="synthetic-test-only",
+        market=market,
+        season_types=season_types,
+        overtime_included=True,
+        outcome_rules={
+            Outcome.WIN: OutcomeReturnRule(requirement=ReturnRequirement.REQUIRED),
+            Outcome.TIE_OR_PUSH: OutcomeReturnRule(
+                requirement=ReturnRequirement.REQUIRED if tie_required else ReturnRequirement.FORBIDDEN
+            ),
+            Outcome.LOSS: OutcomeReturnRule(requirement=ReturnRequirement.REQUIRED, exact="0"),
+        },
+        evidence_ids=("synthetic:test-only",),
+        effective_from=NOW-timedelta(days=30),
+        admission=ProfileAdmission.ADMITTED,
+        admitted_at=NOW-timedelta(days=30),
+        decision_id="synthetic-test-only",
+    )
+
+
+HALF_TOTAL_PROFILE = admitted_profile("test.synthetic.total-half", "total")
+MONEYLINE_PROFILE = admitted_profile("test.synthetic.moneyline-reg", "moneyline", tie_required=True)
+INTEGER_TOTAL_PROFILE = admitted_profile("test.synthetic.total-integer", "total", tie_required=True)
+INTEGER_SPREAD_PROFILE = admitted_profile("test.synthetic.spread-integer", "spread", tie_required=True)
+
+
+def registry(*profiles):
+    return {(profile.profile_id, profile.version): profile for profile in profiles}
+
+
+def profile_ref(profile):
+    return {"profile_id": profile.profile_id, "version": profile.version}
 
 
 def pair(book="Bovada", probability=.5, market="total", line=44.5, kind="direct", observed=None, batch=None):
@@ -20,7 +71,9 @@ def pair(book="Bovada", probability=.5, market="total", line=44.5, kind="direct"
 def input_quote(**kwargs):
     return QuoteInput(game_id=GAME["id"], market=kwargs.pop("market","total"), side=kwargs.pop("side","over"),
                       line=kwargs.pop("line",44.5), total_cost=kwargs.pop("total_cost","8"), winning_payout=kwargs.pop("winning_payout","20"),
-                      observed_at=kwargs.pop("observed_at",NOW), exchange="Kalshi", fees_confirmed=True, rules_confirmed=True, **kwargs)
+                      losing_return=kwargs.pop("losing_return", "0"), observed_at=kwargs.pop("observed_at",NOW),
+                      exchange=kwargs.pop("exchange", "Kalshi"), fees_confirmed=kwargs.pop("fees_confirmed", True),
+                      rules_confirmed=kwargs.pop("rules_confirmed", True), **kwargs)
 
 
 def references(**kwargs):
@@ -37,7 +90,9 @@ def test_coin_minus_115_is_not_fifteen_percent():
 
 
 def test_fees_counted_once_and_cap():
-    r=evaluate(input_quote(),GAME,references(),SETTINGS,[],NOW)
+    q = input_quote(settlement_profile=profile_ref(HALF_TOTAL_PROFILE))
+    r=evaluate(q,GAME,references(),SETTINGS,[],NOW,registry(HALF_TOTAL_PROFILE))
+    assert r["status"] == "MEETS_ESTIMATED_SCREEN"
     assert r["qualified"]
     assert r["net"]["ev"]==2
     assert r["net"]["roi_pct"]==25
@@ -76,11 +131,12 @@ def test_unknown_stale_or_future_age_never_qualifies(kind,offset):
 
 
 def test_tie_sensitivity_uses_worst_return():
-    r=evaluate(input_quote(market="moneyline",side="home",line=None,total_cost="15"),GAME,references(market="moneyline",line=None,probability=.8),SETTINGS,[],NOW)
+    q = input_quote(market="moneyline", side="home", line=None, total_cost="15", push_return="10",
+                    settlement_profile=profile_ref(MONEYLINE_PROFILE))
+    r=evaluate(q,GAME,references(market="moneyline",line=None,probability=.8),SETTINGS,[],NOW,
+               registry(MONEYLINE_PROFILE))
     assert r["net"]["roi_pct"]==pytest.approx((15.7/15-1)*100)
     assert r["net"]["roi_high_pct"]==pytest.approx((16/15-1)*100)
-    post={**GAME,"season_type":"POST"}
-    assert evaluate(input_quote(market="moneyline",side="home",line=None,total_cost="15"),post,references(market="moneyline",line=None,probability=.8),SETTINGS,[],NOW)["net"]["roi_pct"]==pytest.approx((16/15-1)*100)
 
 
 @pytest.mark.parametrize("market,side,line,lower,upper",[("total","over",44,44.5,43.5),("total","under",44,43.5,44.5),("spread","home",-3,-3.5,-2.5)])
@@ -88,12 +144,16 @@ def test_integer_push_from_adjacent_lines(market,side,line,lower,upper):
     # probability argument is for home / over.
     p1,p2=(.6,.5) if side=="under" else (.4,.5)
     qs=references(market=market,line=lower,probability=p1)+references(market=market,line=upper,probability=p2)
-    q=input_quote(market=market,side=side,line=line,push_return="8")
-    r=evaluate(q,GAME,qs,SETTINGS,[],NOW)
+    profile = INTEGER_TOTAL_PROFILE if market == "total" else INTEGER_SPREAD_PROFILE
+    q=input_quote(market=market,side=side,line=line,push_return="8",
+                  settlement_profile=profile_ref(profile))
+    r=evaluate(q,GAME,qs,SETTINGS,[],NOW,registry(profile))
     assert r["probability"]["win"]==pytest.approx(.4)
     assert r["probability"]["push"]==pytest.approx(.1)
     assert r["net"]["ev"]==pytest.approx(.8)
-    assert r["qualified"]
+    assert r["status"] == "RESEARCH_ONLY"
+    assert "INTEGER_LINE_RESEARCH_ONLY" in r["reason_codes"]
+    assert not r["qualified"]
 
 
 def test_unknown_push_is_blocked_and_incompatible_adjacent_lines_rejected():
@@ -106,11 +166,13 @@ def test_unknown_push_is_blocked_and_incompatible_adjacent_lines_rejected():
 
 
 def test_kickoff_quote_age_rules_and_disagreement_gates():
-    q=input_quote()
-    for update in ({"rules_confirmed":False},{"fees_confirmed":False},{"exchange":"Unknown"},{"observed_at":NOW-timedelta(minutes=3)}):
-        assert not evaluate(q.model_copy(update=update),GAME,references(),SETTINGS,[],NOW)["qualified"]
-    assert not evaluate(q,{**GAME,"start_time":iso(NOW)},references(),SETTINGS,[],NOW)["qualified"]
-    assert not evaluate(q,GAME,pair("Bovada",.4)+pair("Circa",.6)+pair("FanDuel",.5),SETTINGS,[],NOW)["qualified"]
+    profiles = registry(HALF_TOTAL_PROFILE)
+    q=input_quote(settlement_profile=profile_ref(HALF_TOTAL_PROFILE))
+    assert evaluate(q.model_copy(update={"rules_confirmed":False}),GAME,references(),SETTINGS,[],NOW,profiles)["qualified"]
+    for update in ({"fees_confirmed":False},{"exchange":"Unknown"},{"observed_at":NOW-timedelta(minutes=3)}):
+        assert not evaluate(q.model_copy(update=update),GAME,references(),SETTINGS,[],NOW,profiles)["qualified"]
+    assert not evaluate(q,{**GAME,"start_time":iso(NOW)},references(),SETTINGS,[],NOW,profiles)["qualified"]
+    assert not evaluate(q,GAME,pair("Bovada",.4)+pair("Circa",.6)+pair("FanDuel",.5),SETTINGS,[],NOW,profiles)["qualified"]
 
 
 def test_exposure_is_separate_and_never_negative():

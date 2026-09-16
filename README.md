@@ -2,32 +2,36 @@
 
 A local NFL price-research dashboard and Underdog quote evaluator.
 
-**Status: research prototype under review.** The application compares reference
-prices and estimates expected value. It has not demonstrated a profitable
-strategy or a verified executable Underdog edge.
+**Status: partial implementation, published as a review checkpoint.** The goal is
+to identify potentially positive-EV NFL quotes using explicit costs, settlement
+returns, and comparable market evidence. The financial core has been reviewed;
+the complete application, real-quote screening, and profitability remain unproven.
 
-## Start here for an independent review
+## Current implementation plan
+
+The governing forward plan is [NFL_EDGE_FINAL_PLAN.md](NFL_EDGE_FINAL_PLAN.md),
+confirmed by the user on September 15, 2026. Local reliability work is underway;
+see [execution status](docs/STATUS.md), [shared contracts](docs/CONTRACTS.md) and
+[verification evidence](docs/VERIFICATION.md) for completed and outstanding gates.
+The prepared [pilot protocol](docs/PILOT_PROTOCOL.md) is inactive. Engineering
+checks do not establish real-quote screening readiness or profitability. Use the
+[independent review prompt](docs/REVIEW_PROMPT.md) and
+[checkpoint results](docs/reports/GITHUB_CHECKPOINT.md) to review this work.
+
+## Historical independent review
 
 Read [the full project plan and review brief](PROJECT_PLAN_FOR_REVIEW.md).
 It contains the requirements, source strategy, formulas, implementation status,
 known defects, acceptance criteria, and questions for the reviewer.
 
-Suggested review request:
-
-> Review PROJECT_PLAN_FOR_REVIEW.md using its reviewer instructions. Inspect the
-> implementation where needed. Challenge the probability, fee, settlement,
-> freshness, and source-independence assumptions. Rank changes that prevent
-> misleading positive-EV estimates, and distinguish a useful research tool from
-> a demonstrated profitable strategy.
-
-The shorter [initial implementation plan](PLAN.md) provides background; the
-full review brief is the current reference for status and unresolved work.
+The shorter [initial implementation plan](PLAN.md) and full review brief remain
+historical evidence; the forward plan and execution ledger now govern new work.
 
 ## Scope
 
 - NFL pregame full-game moneylines, spreads, and totals.
-- Free public reference collectors: ESPN-carried sportsbook prices, Bovada,
-  and supplemental Kalshi comparisons.
+- Free/manual reference evidence; existing ESPN, Bovada, and Kalshi adapters
+  remain unadmitted and need source-policy enforcement.
 - Manual Underdog quote input and manual sportsbook reference pairs.
 - Market-derived probability estimates, fee-aware EV, and evidence checks.
 - Paper/accepted-entry journal, exposure settings, settlement corrections,
@@ -37,58 +41,55 @@ full review brief is the current reference for status and unresolved work.
 Actual placement remains manual in Underdog. This application has no trading,
 deposit, or withdrawal endpoint and requires no sportsbook credentials.
 
-## Current limitations
+## Completed at this checkpoint
 
-- The automated sources currently provide two underlying sportsbooks. Under the
-  prototype's freshness policy, only the directly observed sportsbook can count
-  toward its three-eligible-book screen when fresh. Manual corroboration is needed.
-- Redistributed prices have unknown upstream latency. Kalshi is a comparison,
-  not an Underdog execution price or a sportsbook vote.
-- Five-minute background collection leaves gaps under the two-minute screen.
-- Rule profiles, historical accepted-entry evaluation, result expiry, source
-  handling, and browser-tool staging need further hardening. The review brief
-  distinguishes observed defects from code-review concerns.
-- Complete isolated browser verification, launch scripts, and backup/restore
-  packaging are unfinished.
+- Lazy database initialization and isolated tests, independently reviewed.
+- Explicit Decimal win/tie-or-push/loss returns, profile contradiction checks,
+  versioned settlement profiles, conservative integer-line research calculations,
+  and strict cent ceilings. Independent financial review accepted this scope.
+- Financial preflight for closing calculations; closing timing and quality are
+  separate outstanding work.
+- Exact installed dependency versions, an environment verifier, and a local HTML
+  evidence-report generator.
+- An independently reviewed, inactive prospective pilot specification.
 
-## Run locally
+## Outstanding work
 
-The initial build used Python 3.12 and Node.js 24. Run these commands in PowerShell
-from the project root:
+- `backend/records.py` is an unused, incomplete draft. Immutable entry linkage,
+  idempotency, concurrent settlement/closing, migrations, and stronger local
+  mutation controls are not integrated.
+- UI input/revision binding, expiry, races, accessible mobile flows, and the new
+  financial input fields remain unfinished. The built UI is still the prototype.
+- Parser isolation, durable event identity, trustworthy receipt times, source
+  admission enforcement, on-demand collection, and closing finalization remain open.
+- No real settlement profile or source quality path is admitted. D08 requires
+  initial network collection to be disabled, but application-wide enforcement is
+  not implemented yet. `NFL_EDGE_NO_COLLECT=1` stops the background loop only;
+  the existing refresh endpoint can still initiate network requests.
+- Windows launch/recovery packaging, clean-install verification, complete browser
+  acceptance, and pilot instrumentation remain unfinished.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -e ".[test]"
-cd frontend
-npm ci
-npm run build
-cd ..
-.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8765
-```
-
-Open `http://127.0.0.1:8765/`. Stop the foreground server with Ctrl+C.
-The collectors run while the server is running. Internet access is required for
-reference prices; missing or inaccessible sources are reported in the UI.
-
-The default database is `%LOCALAPPDATA%\SportsBetting\nfl-edge.sqlite3`, outside
-the repository. `NFL_EDGE_DB` overrides the database path; use a separate database
-for experiments. `NFL_EDGE_NO_COLLECT=1` disables background collection for tests.
-
-For frontend development, run the backend above and `npm run dev` in `frontend`;
-Vite serves the interface on port 5173 and proxies `/api` to port 8765.
+The default database is `%LOCALAPPDATA%\SportsBetting\nfl-edge.sqlite3`. Tests
+must use synthetic temporary paths. Do not use real records to review this
+checkpoint. Operational setup and recovery instructions will accompany I07;
+this checkpoint is not a release.
 
 ## Verify
 
 ```powershell
+$env:NFL_EDGE_DB = Join-Path $env:TEMP ('nfl-edge-review-' + [guid]::NewGuid() + '.sqlite3')
+$env:NFL_EDGE_NO_COLLECT = '1'
 .venv\Scripts\python.exe -m pytest -q
-cd frontend
-npm run build
+.venv\Scripts\python.exe scripts/check_environment.py
+npm --prefix frontend run build
 ```
 
-The last implementation verification completed 21 tests and a production build.
-Those tests cover selected financial calculations, data handling, persistence,
-and API workflows. They do not validate a betting strategy or complete the
-outstanding browser and source-quality studies.
+These commands assume the existing pinned development environment: Python
+3.12.10, Node 24.14.1, npm 11.11.0. No packages were installed during this work.
+The push checkpoint passed **81 tests** (two dependency deprecation warnings),
+TypeScript/Vite build, and installed-environment verification. Draft records
+types received a compile/import check, not a dedicated functional review.
+Detailed results and limits are in [verification](docs/VERIFICATION.md).
 
 ## Repository map
 
@@ -97,7 +98,9 @@ outstanding browser and source-quality studies.
 | `backend/domain.py` | Input validation, canonical teams, time and odds conversion |
 | `backend/providers.py` | Public reference collectors and parsers |
 | `backend/engine.py` | Book pairing, probability estimates, EV, evidence and exposure |
+| `backend/settlement_profiles.py` | Versioned payoff/rule profiles; production registry empty |
 | `backend/storage.py` | Local SQLite records and snapshots |
+| `backend/records.py` | Unused draft of future history/intent contracts |
 | `backend/service.py` | Collection, source health, board, closing capture |
 | `backend/app.py` | Local API and production frontend serving |
 | `frontend/src/` | Dashboard and forms |
